@@ -20,14 +20,33 @@ jobs:
         arch: [amd64, arm64]
 
     steps:
-      - name: Checkout
+      - name: Checkout Hysteria
         uses: actions/checkout@v4
+        with:
+          path: hysteria
 
-      - name: Setup Go
+      - name: Checkout KeyHop QUIC
+        uses: actions/checkout@v4
+        with:
+          repository: Ilyandr/quic-go
+          ref: keyhop-quic-lock
+          path: quic-go
+
+      - name: Setup Go 1.20
         uses: actions/setup-go@v5
         with:
-          go-version-file: app/go.mod
+          go-version: "1.20.14"
           cache: false
+
+      - name: Configure QUIC dependency
+        run: |
+          cd hysteria/core
+          go mod edit \
+            -replace=github.com/quic-go/quic-go=../../quic-go
+
+          cd ../app
+          go mod edit \
+            -replace=github.com/quic-go/quic-go=../../quic-go
 
       - name: Build
         env:
@@ -36,21 +55,17 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          cd app
+          cd hysteria/app
+
           go build -trimpath \
             -ldflags="-s -w" \
-            -o ../dist/hysteria1-keyhop-linux-${GOARCH} \
-            .
+            -o ../../dist/hysteria1-keyhop-linux-${GOARCH} \
+            ./cmd
 
-      - name: Generate checksum
-        run: |
-          cd dist
-          sha256sum * > SHA256SUMS-${{ matrix.arch }}.txt
-
-      - name: Upload build
+      - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: linux-${{ matrix.arch }}
+          name: hysteria1-keyhop-linux-${{ matrix.arch }}
           path: dist/*
 
   release:
@@ -59,12 +74,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download binaries
+        uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Create release
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum hysteria1-keyhop-linux-* > SHA256SUMS
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*

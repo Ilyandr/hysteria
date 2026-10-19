@@ -90,7 +90,7 @@ require (
 
 replace github.com/apernet/hysteria/core => ../core/
 
-replace github.com/quic-go/quic-go => github.com/apernet/quic-go v0.34.1-0.20230507231629-ec008b7e8473
+replace github.com/quic-go/quic-go => ../../quic-go
 
 replace github.com/LiamHaworth/go-tproxy => github.com/apernet/go-tproxy v0.0.0-20221025153553-ed04a2935f88
 
