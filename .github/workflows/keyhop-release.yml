@@ -32,13 +32,13 @@ jobs:
           ref: keyhop-quic-lock
           path: quic-go
 
-      - name: Setup Go 1.20
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.20.14"
           cache: false
 
-      - name: Configure QUIC dependency
+      - name: Configure dependencies
         run: |
           cd hysteria/core
           go mod edit \
@@ -48,7 +48,7 @@ jobs:
           go mod edit \
             -replace=github.com/quic-go/quic-go=../../quic-go
 
-      - name: Build
+      - name: Build Linux binary
         env:
           GOOS: linux
           GOARCH: ${{ matrix.arch }}
@@ -62,10 +62,44 @@ jobs:
             -o ../../dist/hysteria1-keyhop-linux-${GOARCH} \
             ./cmd
 
-      - name: Upload binary
+      - name: Build DEB package
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          VERSION="1.3.5-keyhop.1"
+
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+
+          PACKAGE="hysteria1-keyhop_${VERSION}_linux_${ARCH}.deb"
+
+          mkdir -p package/DEBIAN
+          mkdir -p package/usr/bin
+
+          install -m 755 \
+            "dist/hysteria1-keyhop-linux-${ARCH}" \
+            package/usr/bin/hysteria1-keyhop
+
+          cat > package/DEBIAN/control <<EOF
+          Package: hysteria1-keyhop
+          Version: ${VERSION}
+          Section: net
+          Priority: optional
+          Architecture: ${ARCH}
+          Maintainer: KeyHop <support@keyhop.tech>
+          Description: KeyHop Hysteria 1 with custom QUIC transport checks
+          EOF
+
+          dpkg-deb --build --root-owner-group \
+            package "dist/${PACKAGE}"
+
+          dpkg-deb -I "dist/${PACKAGE}"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: hysteria1-keyhop-linux-${{ matrix.arch }}
+          name: keyhop-linux-${{ matrix.arch }}
           path: dist/*
 
   release:
@@ -74,16 +108,16 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download binaries
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Checksums
+      - name: Generate SHA256
         run: |
           cd dist
-          sha256sum hysteria1-keyhop-linux-* > SHA256SUMS
+          sha256sum hysteria1-keyhop-* > SHA256SUMS
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
