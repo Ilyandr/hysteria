@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
+	"io"
 	"math/rand"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/apernet/hysteria/core/acl"
 	"github.com/apernet/hysteria/core/transport"
@@ -291,6 +295,43 @@ func (c *serverClient) handleTCP(stream quic.Stream, host string, port uint16) {
 	if err != nil {
 		return
 	}
+	// Sniff host only when the client sent a bare IP, and only for HTTP/TLS.
+	// Hysteria 1's client waits for serverResponse before sending payload,
+	// so sniffing must happen after OK was sent.
+	if c.ACLEngine != nil && net.ParseIP(host) != nil && (port == 443 || port == 80) {
+		const sniffTimeout = 700 * time.Millisecond
+		const maxSniffBytes = 32768
+		buf := make([]byte, maxSniffBytes)
+		total := 0
+		_ = stream.SetReadDeadline(time.Now().Add(sniffTimeout))
+		for total < len(buf) {
+			n, readErr := stream.Read(buf[total:])
+			total += n
+			domain, done := sniffTCPHostname(buf[:total])
+			if domain != "" {
+				// Apply the existing ACL's decision using the sniffed hostname.
+				// Destination remains the original IP: no DNS-based rerouting.
+				sniffAction, _, _, _, matchErr := c.ACLEngine.ResolveAndMatch(domain, port, false)
+				if matchErr == nil && sniffAction == acl.ActionBlock {
+					_ = stream.SetReadDeadline(time.Time{})
+					return
+				}
+			}
+			if done || readErr != nil || n == 0 {
+				break
+			}
+		}
+		_ = stream.SetReadDeadline(time.Time{})
+		if total > 0 {
+			written, writeErr := io.Copy(conn, bytes.NewReader(buf[:total]))
+			if writeErr != nil {
+				return
+			}
+			if c.TrafficCounter != nil {
+				c.TrafficCounter.Tx(c.AuthLabel, int(written))
+			}
+		}
+	}
 	if c.TrafficCounter != nil {
 		err = utils.Pipe2Way(stream, conn, func(i int) {
 			if i > 0 {
@@ -388,4 +429,136 @@ func (c *serverClient) handleUDP(stream quic.Stream) {
 	c.udpSessionMutex.Lock()
 	delete(c.udpSessionMap, id)
 	c.udpSessionMutex.Unlock()
+}
+
+// sniffTCPHostname returns (hostname, done). It never alters traffic.
+// TLS ClientHello with ECH only exposes the outer SNI (if any).
+func sniffTCPHostname(data []byte) (string, bool) {
+	if len(data) == 0 {
+		return "", false
+	}
+	if data[0] == 0x16 {
+		if len(data) < 5 {
+			return "", false
+		}
+		if data[1] != 3 {
+			return "", true
+		}
+		recordLen := int(binary.BigEndian.Uint16(data[3:5]))
+		if recordLen < 4 || recordLen > 16384 {
+			return "", true
+		}
+		if len(data) < 5+recordLen {
+			return "", false
+		}
+		return sniffTLSName(data[5 : 5+recordLen]), true
+	}
+	if bytes.IndexByte(data, '\n') < 0 && len(data) < 16 {
+		return "", false
+	}
+	// HTTP request: only inspect up to the first complete header block.
+	end := bytes.Index(data, []byte("\r\n\r\n"))
+	if end < 0 {
+		return "", len(data) >= 8192
+	}
+	for _, line := range bytes.Split(data[:end], []byte("\r\n"))[1:] {
+		if len(line) >= 5 && bytes.EqualFold(line[:5], []byte("Host:")) {
+			host := strings.TrimSpace(string(line[5:]))
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			} else if i := strings.LastIndexByte(host, ':'); i >= 0 && !strings.Contains(host, "]") {
+				host = host[:i]
+			}
+			return normalizeSniffName(host), true
+		}
+	}
+	return "", true
+}
+
+func sniffTLSName(data []byte) string {
+	// TLS handshake: type(1) length(3) legacy_version(2) random(32).
+	if len(data) < 4 || data[0] != 1 {
+		return ""
+	}
+	helloLen := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	if helloLen < 34 || helloLen+4 > len(data) {
+		return ""
+	}
+	p := data[4 : helloLen+4]
+	p = p[34:]
+	if len(p) < 1 {
+		return ""
+	}
+	n := int(p[0])
+	p = p[1:]
+	if len(p) < n+2 {
+		return ""
+	}
+	p = p[n:]
+	n = int(binary.BigEndian.Uint16(p[:2]))
+	p = p[2:]
+	if len(p) < n+1 {
+		return ""
+	}
+	p = p[n:]
+	n = int(p[0])
+	p = p[1:]
+	if len(p) < n+2 {
+		return ""
+	}
+	p = p[n:]
+	n = int(binary.BigEndian.Uint16(p[:2]))
+	p = p[2:]
+	if len(p) < n {
+		return ""
+	}
+	p = p[:n]
+	for len(p) >= 4 {
+		typ := binary.BigEndian.Uint16(p[:2])
+		size := int(binary.BigEndian.Uint16(p[2:4]))
+		p = p[4:]
+		if size > len(p) {
+			return ""
+		}
+		if typ == 0 {
+			e := p[:size]
+			if len(e) < 2 {
+				return ""
+			}
+			listLen := int(binary.BigEndian.Uint16(e[:2]))
+			e = e[2:]
+			if len(e) < listLen {
+				return ""
+			}
+			e = e[:listLen]
+			for len(e) >= 3 {
+				kind := e[0]
+				nameLen := int(binary.BigEndian.Uint16(e[1:3]))
+				e = e[3:]
+				if nameLen > len(e) {
+					return ""
+				}
+				if kind == 0 {
+					return normalizeSniffName(string(e[:nameLen]))
+				}
+				e = e[nameLen:]
+			}
+			return ""
+		}
+		p = p[size:]
+	}
+	return ""
+}
+
+func normalizeSniffName(host string) string {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if len(host) == 0 || len(host) > 253 || net.ParseIP(host) != nil || strings.ContainsAny(host, " \r\n\t\x00/\\") {
+		return ""
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return ""
+		}
+	}
+	return host
 }
