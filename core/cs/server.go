@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+        "os"
 	"fmt"
 	"net"
 
@@ -59,12 +60,43 @@ func NewServer(tlsConfig *tls.Config, quicConfig *quic.Config,
 	udpRequestFunc UDPRequestFunc, udpErrorFunc UDPErrorFunc,
 	trafficCounter TrafficCounter,
 ) (*Server, error) {
-	quicConfig.DisablePathMTUDiscovery = quicConfig.DisablePathMTUDiscovery || pmtud.DisablePathMTUDiscovery
+
+	quicConfig.DisablePathMTUDiscovery =
+		quicConfig.DisablePathMTUDiscovery || pmtud.DisablePathMTUDiscovery
+
+	// Load persistent QUIC Stateless Reset key.
+	const resetKeyPath = "/etc/hysteria1/stateless-reset.key"
+
+	resetKeyBytes, err := os.ReadFile(resetKeyPath)
+	if err != nil {
+		_ = pktConn.Close()
+		return nil, fmt.Errorf(
+			"failed to read stateless reset key from %s: %w",
+			resetKeyPath,
+			err,
+		)
+	}
+
+	if len(resetKeyBytes) != 32 {
+		_ = pktConn.Close()
+		return nil, fmt.Errorf(
+			"invalid stateless reset key length: got %d, expected 32",
+			len(resetKeyBytes),
+		)
+	}
+
+	var resetKey quic.StatelessResetKey
+	copy(resetKey[:], resetKeyBytes)
+
+	quicConfig.StatelessResetKey = &resetKey
+
+	// Start QUIC listener.
 	listener, err := quic.Listen(pktConn, tlsConfig, quicConfig)
 	if err != nil {
 		_ = pktConn.Close()
 		return nil, err
 	}
+
 	s := &Server{
 		pktConn:        pktConn,
 		listener:       listener,
@@ -81,6 +113,7 @@ func NewServer(tlsConfig *tls.Config, quicConfig *quic.Config,
 		udpErrorFunc:   udpErrorFunc,
 		trafficCounter: trafficCounter,
 	}
+
 	return s, nil
 }
 
